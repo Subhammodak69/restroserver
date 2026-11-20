@@ -39,3 +39,9 @@ Start the API with `npm run dev --prefix server`. The HTTP server also hosts aut
 - Health: `GET /api/health`
 
 Dummy payment records are marked simulated; no gateway is connected and no real money is charged.
+
+## Order operations
+
+Managers accept new orders from the admin Orders screen. Accepted items assigned to a kitchen station appear on the station-specific kitchen display; kitchen staff can move each item from `NEW` to `PREPARING` to `READY`. Create stations and assign them to kitchen staff under admin Settings, and assign each menu item to its station in the catalog.
+
+Home-delivery jobs are managed in the admin Delivery screen. Assign an active delivery staff account, then advance the job through pickup, on-the-way, and delivered. Customer tracking refreshes from the API and listens for authenticated Socket.IO order, item, and delivery events.

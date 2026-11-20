@@ -82,9 +82,10 @@ router.post('/staff/login', otpLimiter, asyncHandler(async (req, res) => {
 
 router.get('/me', authenticate, asyncHandler(async (req, res) => {
   const isCustomer = req.identity.role === 'CUSTOMER';
-  const table = isCustomer ? 'customers' : 'staff';
-  const select = isCustomer ? 'id,phone,name,points_balance AS points' : 'id,phone,name,role,restaurant_id AS "restaurantId"';
-  const { rows } = await getPool().query(`SELECT ${select} FROM ${table} WHERE id=$1`, [req.identity.sub]);
+  const { rows } = isCustomer
+    ? await getPool().query(`SELECT id,phone,name,points_balance AS points FROM customers WHERE id=$1`, [req.identity.sub])
+    : await getPool().query(`SELECT s.id,s.phone,s.name,s.role,s.restaurant_id AS "restaurantId",r.name AS "restaurantName",s.station_id AS "stationId",st.name AS "stationName"
+       FROM staff s LEFT JOIN restaurants r ON r.id=s.restaurant_id LEFT JOIN stations st ON st.id=s.station_id WHERE s.id=$1`, [req.identity.sub]);
   if (!rows.length) return res.status(401).json({ success: false, message: 'Account is unavailable.' });
   res.json({ success: true, data: rows[0] });
 }));

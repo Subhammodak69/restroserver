@@ -25,7 +25,10 @@ router.get('/orders',requireRole('MANAGER','WAITER','KITCHEN'),asyncHandler(asyn
 
 router.get('/stations/:stationId/queue',requireRole('MANAGER','KITCHEN'),asyncHandler(async(req,res)=>{
  if(req.identity.role==='KITCHEN'&&Number(req.params.stationId)!==Number(req.identity.stationId))return res.status(403).json({success:false,message:'This account is assigned to another kitchen station.'});
- const {rows}=await getPool().query(`SELECT oi.id,oi.item_name AS name,oi.quantity,oi.status,oi.note,oi.options,o.id AS "orderId",o.order_number AS "orderNumber",o.placed_at AS "placedAt",t.number AS "tableNumber" FROM order_items oi JOIN orders o ON o.id=oi.order_id LEFT JOIN table_sessions ts ON ts.id=o.session_id LEFT JOIN restaurant_tables t ON t.id=ts.table_id WHERE oi.station_id=$1 AND oi.status IN ('NEW','PREPARING','READY') ORDER BY o.placed_at`,[req.params.stationId]);
+ const {rows}=await getPool().query(`SELECT oi.id,oi.item_name AS name,oi.quantity,oi.status,oi.note,oi.options,o.id AS "orderId",o.order_number AS "orderNumber",o.order_type AS "orderType",o.status AS "orderStatus",o.placed_at AS "placedAt",t.number AS "tableNumber"
+  FROM order_items oi JOIN orders o ON o.id=oi.order_id LEFT JOIN table_sessions ts ON ts.id=o.session_id LEFT JOIN restaurant_tables t ON t.id=ts.table_id
+  WHERE oi.station_id=$1 AND oi.status IN ('NEW','PREPARING','READY') AND o.status IN ('ACCEPTED','PREPARING','READY')
+  ORDER BY o.placed_at`,[req.params.stationId]);
  res.json({success:true,data:rows});
 }));
 
@@ -35,20 +38,32 @@ router.patch('/order-items/:id/status',requireRole('MANAGER','KITCHEN','WAITER')
  const client=await getPool().connect();
  try{
   await client.query('BEGIN');
-  const item=await client.query(`SELECT oi.id,oi.order_id,oi.station_id,oi.status,o.session_id FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE oi.id=$1 FOR UPDATE`,[req.params.id]);
+  const item=await client.query(`SELECT oi.id,oi.order_id,oi.station_id,oi.status,o.session_id,o.customer_id,o.order_number,o.order_type,o.status AS order_status FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE oi.id=$1 FOR UPDATE`,[req.params.id]);
   if(!item.rowCount){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Order item not found.'});}
   if(req.identity.role==='KITCHEN'&&Number(item.rows[0].station_id)!==Number(req.identity.stationId)){await client.query('ROLLBACK');return res.status(403).json({success:false,message:'This item belongs to another station.'});}
   const allowed={NEW:['PREPARING','CANCELLED'],PREPARING:['READY','CANCELLED'],READY:['SERVED'],SERVED:[],CANCELLED:[]};
   if(!allowed[item.rows[0].status]?.includes(next)){await client.query('ROLLBACK');return res.status(409).json({success:false,message:`Cannot move item from ${item.rows[0].status} to ${next}.`});}
   const {rows}=await client.query(`UPDATE order_items SET status=$2 WHERE id=$1 RETURNING id,status,order_id AS "orderId"`,[req.params.id,next]);
   const ready=await client.query(`SELECT COUNT(*) FILTER(WHERE status NOT IN ('READY','SERVED','CANCELLED'))::int AS remaining,COUNT(*) FILTER(WHERE status='CANCELLED')::int AS cancelled FROM order_items WHERE order_id=$1`,[item.rows[0].order_id]);
-  if(ready.rows[0].remaining===0&&ready.rows[0].cancelled===0)await client.query(`UPDATE orders SET status='READY',updated_at=NOW() WHERE id=$1 AND status IN ('NEW','ACCEPTED','PREPARING')`,[item.rows[0].order_id]);
-  else if(next==='PREPARING')await client.query(`UPDATE orders SET status='PREPARING',updated_at=NOW() WHERE id=$1 AND status IN ('NEW','ACCEPTED')`,[item.rows[0].order_id]);
+  if(ready.rows[0].remaining===0&&ready.rows[0].cancelled===0){
+   await client.query(`UPDATE orders SET status='READY',updated_at=NOW() WHERE id=$1 AND status IN ('ACCEPTED','PREPARING')`,[item.rows[0].order_id]);
+  }else if(next==='PREPARING'){
+   await client.query(`UPDATE orders SET status='PREPARING',updated_at=NOW() WHERE id=$1 AND status='ACCEPTED'`,[item.rows[0].order_id]);
+  }
+  const currentOrder=await client.query(`SELECT status FROM orders WHERE id=$1`,[item.rows[0].order_id]);
+  const orderStatus=currentOrder.rows[0].status;
   await client.query('COMMIT');
-  const event={...rows[0],sessionId:item.rows[0].session_id};
+  const event={...rows[0],sessionId:item.rows[0].session_id,customerId:item.rows[0].customer_id,orderNumber:item.rows[0].order_number,orderStatus};
   realtime.publish(`restaurant:${rid(req)}:staff`,'orderItem.updated',event);
   if(item.rows[0].station_id)realtime.publish(`restaurant:${rid(req)}:station:${item.rows[0].station_id}`,'orderItem.updated',event);
   if(event.sessionId)realtime.publish(`session:${event.sessionId}`,'orderItem.updated',event);
+  realtime.publish(`customer:${event.customerId}`,'orderItem.updated',event);
+  if(orderStatus!==item.rows[0].order_status){
+   const statusEvent={orderId:Number(event.orderId),orderNumber:event.orderNumber,status:orderStatus,orderType:item.rows[0].order_type};
+   realtime.publish(`restaurant:${rid(req)}:staff`,'order.updated',statusEvent);
+   realtime.publish(`customer:${event.customerId}`,'order.updated',statusEvent);
+   if(event.sessionId)realtime.publish(`session:${event.sessionId}`,'order.updated',statusEvent);
+  }
   res.json({success:true,data:event});
  }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }));

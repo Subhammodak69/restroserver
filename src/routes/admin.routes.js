@@ -42,15 +42,17 @@ router.get('/orders',asyncHandler(async(req,res)=>{
  res.json({success:true,data:rows});
 }));
 
-const transitions={NEW:['ACCEPTED','CANCELLED'],ACCEPTED:['PREPARING','CANCELLED'],PREPARING:['READY'],READY:['SERVED','OUT_FOR_DELIVERY'],OUT_FOR_DELIVERY:['DELIVERED'],SERVED:[],DELIVERED:[],CANCELLED:[]};
+const transitions={NEW:['ACCEPTED','CANCELLED'],ACCEPTED:['PREPARING','CANCELLED'],PREPARING:['READY'],READY:['SERVED'],SERVED:[],DELIVERED:[],CANCELLED:[]};
 router.patch('/orders/:id/status',asyncHandler(async(req,res)=>{
  if(!validId(req.params.id))return res.status(400).json({success:false,message:'Invalid order id.'});
  const next=String(req.body.status||'').toUpperCase();
  const current=await getPool().query(`SELECT id,status,order_type,session_id FROM orders WHERE id=$1`,[req.params.id]);
  if(!current.rowCount)return res.status(404).json({success:false,message:'Order not found.'});
+ if(current.rows[0].order_type==='DELIVERY'&&next==='SERVED')return res.status(409).json({success:false,message:'Home delivery orders must be completed from Delivery management.'});
  if(!transitions[current.rows[0].status]?.includes(next))return res.status(409).json({success:false,message:`Cannot move order from ${current.rows[0].status} to ${next}.`});
  const {rows}=await getPool().query(`UPDATE orders SET status=$2,updated_at=NOW() WHERE id=$1 RETURNING id,order_number AS "orderNumber",status,order_type AS "orderType",session_id AS "sessionId"`,[req.params.id,next]);
  if(next==='SERVED')await getPool().query(`UPDATE order_items SET status='SERVED' WHERE order_id=$1 AND status='READY'`,[req.params.id]);
+ if(next==='CANCELLED')await getPool().query(`UPDATE order_items SET status='CANCELLED' WHERE order_id=$1 AND status IN ('NEW','PREPARING')`,[req.params.id]);
  await audit(req,'ORDER_STATUS_CHANGED','order',req.params.id,{status:next});
  realtime.publish(`restaurant:${restaurantId(req)}:staff`,'order.updated',rows[0]);
  if(rows[0].sessionId)realtime.publish(`session:${rows[0].sessionId}`,'order.updated',rows[0]);
@@ -122,11 +124,66 @@ router.get('/tables/:id/qr',asyncHandler(async(req,res)=>{const {rows}=await get
 router.get('/requests',asyncHandler(async(req,res)=>{const {rows}=await getPool().query(`SELECT sr.id,sr.type,sr.status,sr.created_at AS "createdAt",t.id AS "tableId",t.number AS "tableNumber" FROM service_requests sr JOIN table_sessions ts ON ts.id=sr.session_id JOIN restaurant_tables t ON t.id=ts.table_id WHERE t.restaurant_id=$1 AND sr.status='OPEN' ORDER BY sr.created_at`,[restaurantId(req)]);res.json({success:true,data:rows});}));
 router.patch('/requests/:id/resolve',asyncHandler(async(req,res)=>{const {rows}=await getPool().query(`UPDATE service_requests sr SET status='DONE',resolved_at=NOW() FROM table_sessions ts,restaurant_tables t WHERE sr.id=$1 AND sr.session_id=ts.id AND ts.table_id=t.id AND t.restaurant_id=$2 RETURNING sr.id,sr.session_id AS "sessionId",sr.type,sr.status`,[req.params.id,restaurantId(req)]);if(!rows.length)return res.status(404).json({success:false,message:'Request not found.'});await getPool().query(`UPDATE restaurant_tables SET status=CASE WHEN status='NEEDS_HELP' THEN 'OCCUPIED' ELSE status END WHERE id=(SELECT table_id FROM table_sessions WHERE id=$1)`,[rows[0].sessionId]);await audit(req,'SERVICE_REQUEST_RESOLVED','service_request',req.params.id);realtime.publish(`session:${rows[0].sessionId}`,'serviceRequest.resolved',rows[0]);realtime.publish(`restaurant:${restaurantId(req)}:staff`,'serviceRequest.resolved',rows[0]);res.json({success:true,data:rows[0]});}));
 
-router.get('/delivery',asyncHandler(async(req,res)=>{const {rows}=await getPool().query(`SELECT o.id,o.order_number AS "orderNumber",o.status,o.address,o.total,o.placed_at AS "placedAt",dj.status AS "deliveryStatus",dj.estimated_minutes AS "estimatedMinutes",s.id AS "staffId",s.name AS "staffName" FROM orders o JOIN delivery_jobs dj ON dj.order_id=o.id LEFT JOIN staff s ON s.id=dj.staff_id ORDER BY o.placed_at DESC LIMIT 200`);res.json({success:true,data:rows});}));
-router.patch('/delivery/:orderId',asyncHandler(async(req,res)=>{const status=String(req.body.status||'').toUpperCase();const allowed=['UNASSIGNED','ASSIGNED','PICKED_UP','ON_THE_WAY','DELIVERED','FAILED'];if(!allowed.includes(status))return res.status(400).json({success:false,message:'Invalid delivery status.'});const staffId=req.body.staffId||null;const result=await getPool().query(`UPDATE delivery_jobs dj SET status=$2,staff_id=COALESCE($3,dj.staff_id),updated_at=NOW() FROM orders o WHERE dj.order_id=o.id AND o.id=$1 RETURNING dj.order_id AS "orderId",dj.status,dj.staff_id AS "staffId",o.customer_id AS "customerId"`,[req.params.orderId,status,staffId]);if(!result.rowCount)return res.status(404).json({success:false,message:'Delivery order not found.'});const d=result.rows[0];if(status==='DELIVERED')await getPool().query(`UPDATE orders SET status='DELIVERED',updated_at=NOW() WHERE id=$1`,[d.orderId]);await audit(req,'DELIVERY_STATUS_CHANGED','delivery',d.orderId,{status,staffId});realtime.publish(`customer:${d.customerId}`,'delivery.statusChanged',{orderId:d.orderId,status});res.json({success:true,data:d});}));
+router.get('/delivery',asyncHandler(async(req,res)=>{
+ const {rows}=await getPool().query(`SELECT o.id,o.order_number AS "orderNumber",o.status,o.address,o.total,o.placed_at AS "placedAt",dj.status AS "deliveryStatus",dj.estimated_minutes AS "estimatedMinutes",s.id AS "staffId",s.name AS "staffName"
+  FROM orders o JOIN delivery_jobs dj ON dj.order_id=o.id LEFT JOIN staff s ON s.id=dj.staff_id
+  ORDER BY o.placed_at DESC LIMIT 200`);
+ res.json({success:true,data:rows});
+}));
+router.patch('/delivery/:orderId',asyncHandler(async(req,res)=>{
+ const status=String(req.body.status||'').toUpperCase();
+ const transitions={UNASSIGNED:['ASSIGNED'],ASSIGNED:['ASSIGNED','UNASSIGNED','PICKED_UP'],PICKED_UP:['ON_THE_WAY','FAILED'],ON_THE_WAY:['DELIVERED','FAILED'],FAILED:['ASSIGNED'],DELIVERED:[]};
+ if(!Object.prototype.hasOwnProperty.call(transitions,status))return res.status(400).json({success:false,message:'Invalid delivery status.'});
+ const current=await getPool().query(`SELECT dj.status AS "deliveryStatus",dj.staff_id AS "staffId",o.id,o.status AS "orderStatus",o.order_type AS "orderType",o.customer_id AS "customerId",o.order_number AS "orderNumber",o.session_id AS "sessionId"
+  FROM delivery_jobs dj JOIN orders o ON o.id=dj.order_id WHERE o.id=$1`,[req.params.orderId]);
+ if(!current.rowCount)return res.status(404).json({success:false,message:'Delivery order not found.'});
+ const order=current.rows[0];
+ if(order.orderType!=='DELIVERY')return res.status(409).json({success:false,message:'Only home delivery orders can be assigned to a courier.'});
+ const staffId=req.body.staffId===undefined?(status==='UNASSIGNED'?null:order.staffId):Number(req.body.staffId)||null;
+ if(!transitions[order.deliveryStatus]?.includes(status))return res.status(409).json({success:false,message:`Cannot move delivery from ${order.deliveryStatus} to ${status}.`});
+ if(status==='ASSIGNED'&&!staffId)return res.status(400).json({success:false,message:'Choose an active delivery staff member first.'});
+ if(['PICKED_UP','ON_THE_WAY','DELIVERED'].includes(status)&&!staffId)return res.status(409).json({success:false,message:'Assign a delivery staff member before updating delivery progress.'});
+ if(status==='PICKED_UP'&&order.orderStatus!=='READY')return res.status(409).json({success:false,message:'The kitchen must mark this order ready before pickup.'});
+ if(staffId){
+  const assigned=await getPool().query(`SELECT id FROM staff WHERE id=$1 AND restaurant_id=$2 AND role='DELIVERY' AND is_active=TRUE`,[staffId,restaurantId(req)]);
+  if(!assigned.rowCount)return res.status(400).json({success:false,message:'Choose an active delivery staff account for this restaurant.'});
+ }
+ const result=await getPool().query(`UPDATE delivery_jobs SET status=$2,staff_id=$3,updated_at=NOW() WHERE order_id=$1 RETURNING order_id AS "orderId",status,staff_id AS "staffId"`,[req.params.orderId,status,staffId]);
+ const nextOrderStatus=status==='DELIVERED'?'DELIVERED':['PICKED_UP','ON_THE_WAY'].includes(status)?'OUT_FOR_DELIVERY':order.orderStatus;
+ if(nextOrderStatus!==order.orderStatus)await getPool().query(`UPDATE orders SET status=$2,updated_at=NOW() WHERE id=$1`,[req.params.orderId,nextOrderStatus]);
+ const event={...result.rows[0],customerId:order.customerId,orderNumber:order.orderNumber,orderStatus:nextOrderStatus,sessionId:order.sessionId};
+ await audit(req,'DELIVERY_STATUS_CHANGED','delivery',req.params.orderId,{status,staffId});
+ realtime.publish(`customer:${event.customerId}`,'delivery.statusChanged',event);
+ realtime.publish(`restaurant:${restaurantId(req)}:staff`,'delivery.statusChanged',event);
+ if(event.sessionId)realtime.publish(`session:${event.sessionId}`,'delivery.statusChanged',event);
+ if(nextOrderStatus!==order.orderStatus){
+  const statusEvent={orderId:Number(event.orderId),orderNumber:event.orderNumber,status:nextOrderStatus,orderType:'DELIVERY'};
+  realtime.publish(`customer:${event.customerId}`,'order.updated',statusEvent);
+  realtime.publish(`restaurant:${restaurantId(req)}:staff`,'order.updated',statusEvent);
+ }
+ res.json({success:true,data:event});
+}));
 
-router.get('/staff',asyncHandler(async(req,res)=>{const {rows}=await getPool().query(`SELECT id,name,phone,role,station_id AS "stationId",is_active AS "isActive",created_at AS "createdAt" FROM staff WHERE restaurant_id=$1 ORDER BY name`,[restaurantId(req)]);res.json({success:true,data:rows});}));
-router.post('/staff',asyncHandler(async(req,res)=>{const {name,password,role}=req.body;const phone=normalizePhone(req.body.phone);const allowed=['WAITER','KITCHEN','DELIVERY','MANAGER'];if(!String(name||'').trim()||!phone||String(password||'').length<8||!allowed.includes(role))return res.status(400).json({success:false,message:'Provide name, valid phone, password (8+ chars), and a valid role.'});const hash=await hashPassword(password);const {rows}=await getPool().query(`INSERT INTO staff(restaurant_id,name,phone,password_hash,role,station_id) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,name,phone,role,station_id AS "stationId"`,[restaurantId(req),name,phone,hash,role,req.body.stationId||null]);await audit(req,'STAFF_CREATED','staff',rows[0].id,{role});res.status(201).json({success:true,data:rows[0]});}));
+router.get('/staff',asyncHandler(async(req,res)=>{
+ const {rows}=await getPool().query(`SELECT s.id,s.name,s.phone,s.role,s.station_id AS "stationId",st.name AS "stationName",s.is_active AS "isActive",s.created_at AS "createdAt"
+  FROM staff s LEFT JOIN stations st ON st.id=s.station_id WHERE s.restaurant_id=$1 ORDER BY s.name`,[restaurantId(req)]);
+ res.json({success:true,data:rows});
+}));
+router.post('/staff',asyncHandler(async(req,res)=>{
+ const {name,password,role}=req.body,phone=normalizePhone(req.body.phone);
+ const allowed=['WAITER','KITCHEN','DELIVERY','MANAGER'];
+ const stationId=Number(req.body.stationId)||null;
+ if(!String(name||'').trim()||!phone||String(password||'').length<8||!allowed.includes(role))return res.status(400).json({success:false,message:'Provide name, valid phone, password (8+ chars), and a valid role.'});
+ if(role==='KITCHEN'&&!stationId)return res.status(400).json({success:false,message:'Assign a kitchen station to this account.'});
+ if(stationId){
+  const station=await getPool().query(`SELECT id FROM stations WHERE id=$1 AND restaurant_id=$2 AND is_active=TRUE`,[stationId,restaurantId(req)]);
+  if(!station.rowCount)return res.status(400).json({success:false,message:'Choose an active kitchen station for this restaurant.'});
+ }
+ const hash=await hashPassword(password);
+ const {rows}=await getPool().query(`INSERT INTO staff(restaurant_id,name,phone,password_hash,role,station_id) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,name,phone,role,station_id AS "stationId"`,[restaurantId(req),name.trim(),phone,hash,role,role==='KITCHEN'?stationId:null]);
+ await audit(req,'STAFF_CREATED','staff',rows[0].id,{role,stationId:rows[0].stationId});
+ res.status(201).json({success:true,data:rows[0]});
+}));
 router.patch('/staff/:id',asyncHandler(async(req,res)=>{const isActive=req.body.isActive==null?null:Boolean(req.body.isActive),role=req.body.role||null;const allowed=['MANAGER','WAITER','KITCHEN','DELIVERY'];if(role&&!allowed.includes(role))return res.status(400).json({success:false,message:'Invalid staff role.'});let passwordHash=null;if(req.body.password){if(String(req.body.password).length<8)return res.status(400).json({success:false,message:'Password must be at least 8 characters.'});passwordHash=await hashPassword(req.body.password);}const {rows}=await getPool().query(`UPDATE staff SET name=COALESCE($3,name),role=COALESCE($4,role),is_active=COALESCE($5,is_active),station_id=COALESCE($6,station_id),password_hash=COALESCE($7,password_hash) WHERE id=$1 AND restaurant_id=$2 RETURNING id,name,phone,role,station_id AS "stationId",is_active AS "isActive"`,[req.params.id,restaurantId(req),req.body.name??null,role,isActive,req.body.stationId??null,passwordHash]);if(!rows.length)return res.status(404).json({success:false,message:'Staff account not found.'});await audit(req,'STAFF_UPDATED','staff',req.params.id,{role,isActive});res.json({success:true,data:rows[0]});}));
 
 router.get('/zones',asyncHandler(async(req,res)=>{const {rows}=await getPool().query(`SELECT id,postal_code AS "postalCode",delivery_fee AS "deliveryFee",minimum_order AS "minimumOrder",estimated_minutes AS "estimatedMinutes",is_active AS "isActive" FROM delivery_zones WHERE restaurant_id=$1 ORDER BY postal_code`,[restaurantId(req)]);res.json({success:true,data:rows});}));

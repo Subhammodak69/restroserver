@@ -25,9 +25,10 @@ router.get('/:id',asyncHandler(async(req,res)=>{
  const {rows}=await getPool().query(
   `SELECT o.id,o.order_number AS "orderNumber",o.order_type AS "orderType",o.status,o.payment_status AS "paymentStatus",o.address,o.subtotal,o.tax,o.service_charge AS "serviceCharge",o.delivery_fee AS "deliveryFee",o.total,o.placed_at AS "placedAt",
           COALESCE(jsonb_agg(jsonb_build_object('name',oi.item_name,'quantity',oi.quantity,'unitPrice',oi.unit_price,'lineTotal',oi.line_total,'status',oi.status,'options',oi.options)) FILTER(WHERE oi.id IS NOT NULL),'[]'::jsonb) AS items,
-          dj.status AS "deliveryStatus",dj.estimated_minutes AS "estimatedMinutes"
+          dj.status AS "deliveryStatus",dj.estimated_minutes AS "estimatedMinutes",s.name AS "deliveryStaffName"
    FROM orders o LEFT JOIN order_items oi ON oi.order_id=o.id LEFT JOIN delivery_jobs dj ON dj.order_id=o.id
-   WHERE o.id=$1 AND o.customer_id=$2 GROUP BY o.id,dj.id`,[req.params.id,req.identity.sub]
+   LEFT JOIN staff s ON s.id=dj.staff_id
+   WHERE o.id=$1 AND o.customer_id=$2 GROUP BY o.id,dj.id,s.id`,[req.params.id,req.identity.sub]
  );
  if(!rows.length)return res.status(404).json({success:false,message:'Order not found.'});
  res.json({success:true,data:rows[0]});
