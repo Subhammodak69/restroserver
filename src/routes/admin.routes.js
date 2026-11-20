@@ -46,7 +46,7 @@ const transitions={NEW:['ACCEPTED','CANCELLED'],ACCEPTED:['PREPARING','CANCELLED
 router.patch('/orders/:id/status',asyncHandler(async(req,res)=>{
  if(!validId(req.params.id))return res.status(400).json({success:false,message:'Invalid order id.'});
  const next=String(req.body.status||'').toUpperCase();
- const current=await getPool().query(`SELECT id,status,order_type,session_id FROM orders WHERE id=$1`,[req.params.id]);
+ const current=await getPool().query(`SELECT id,status,order_type,session_id,customer_id FROM orders WHERE id=$1`,[req.params.id]);
  if(!current.rowCount)return res.status(404).json({success:false,message:'Order not found.'});
  if(current.rows[0].order_type==='DELIVERY'&&next==='SERVED')return res.status(409).json({success:false,message:'Home delivery orders must be completed from Delivery management.'});
  if(!transitions[current.rows[0].status]?.includes(next))return res.status(409).json({success:false,message:`Cannot move order from ${current.rows[0].status} to ${next}.`});
@@ -55,6 +55,7 @@ router.patch('/orders/:id/status',asyncHandler(async(req,res)=>{
  if(next==='CANCELLED')await getPool().query(`UPDATE order_items SET status='CANCELLED' WHERE order_id=$1 AND status IN ('NEW','PREPARING')`,[req.params.id]);
  await audit(req,'ORDER_STATUS_CHANGED','order',req.params.id,{status:next});
  realtime.publish(`restaurant:${restaurantId(req)}:staff`,'order.updated',rows[0]);
+ if(current.rows[0].customer_id)realtime.publish(`customer:${current.rows[0].customer_id}`,'order.updated',rows[0]);
  if(rows[0].sessionId)realtime.publish(`session:${rows[0].sessionId}`,'order.updated',rows[0]);
  const order=await getPool().query(`SELECT customer_id FROM orders WHERE id=$1`,[req.params.id]);
  realtime.publish(`customer:${order.rows[0].customer_id}`,'order.updated',rows[0]);
@@ -127,15 +128,16 @@ router.patch('/requests/:id/resolve',asyncHandler(async(req,res)=>{const {rows}=
 router.get('/delivery',asyncHandler(async(req,res)=>{
  const {rows}=await getPool().query(`SELECT o.id,o.order_number AS "orderNumber",o.status,o.address,o.total,o.placed_at AS "placedAt",dj.status AS "deliveryStatus",dj.estimated_minutes AS "estimatedMinutes",s.id AS "staffId",s.name AS "staffName"
   FROM orders o JOIN delivery_jobs dj ON dj.order_id=o.id LEFT JOIN staff s ON s.id=dj.staff_id
-  ORDER BY o.placed_at DESC LIMIT 200`);
+  WHERE o.restaurant_id=$1 ORDER BY o.placed_at DESC LIMIT 200`,[restaurantId(req)]);
  res.json({success:true,data:rows});
 }));
 router.patch('/delivery/:orderId',asyncHandler(async(req,res)=>{
+ if(!validId(req.params.orderId))return res.status(400).json({success:false,message:'Invalid order id.'});
  const status=String(req.body.status||'').toUpperCase();
  const transitions={UNASSIGNED:['ASSIGNED'],ASSIGNED:['ASSIGNED','UNASSIGNED','PICKED_UP'],PICKED_UP:['ON_THE_WAY','FAILED'],ON_THE_WAY:['DELIVERED','FAILED'],FAILED:['ASSIGNED'],DELIVERED:[]};
  if(!Object.prototype.hasOwnProperty.call(transitions,status))return res.status(400).json({success:false,message:'Invalid delivery status.'});
  const current=await getPool().query(`SELECT dj.status AS "deliveryStatus",dj.staff_id AS "staffId",o.id,o.status AS "orderStatus",o.order_type AS "orderType",o.customer_id AS "customerId",o.order_number AS "orderNumber",o.session_id AS "sessionId"
-  FROM delivery_jobs dj JOIN orders o ON o.id=dj.order_id WHERE o.id=$1`,[req.params.orderId]);
+  FROM delivery_jobs dj JOIN orders o ON o.id=dj.order_id WHERE o.id=$1 AND o.restaurant_id=$2`,[req.params.orderId,restaurantId(req)]);
  if(!current.rowCount)return res.status(404).json({success:false,message:'Delivery order not found.'});
  const order=current.rows[0];
  if(order.orderType!=='DELIVERY')return res.status(409).json({success:false,message:'Only home delivery orders can be assigned to a courier.'});
